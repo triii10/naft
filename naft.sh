@@ -1,3 +1,5 @@
+#!/bin/bash
+
 # @describe (Not-Another-Fing-Tool) CLI to automate benchmarking a VM with fio and capturing perf trace
 
 # @meta version 0.0.1
