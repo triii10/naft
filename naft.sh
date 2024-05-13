@@ -72,6 +72,11 @@ prerequisites() {
 
 start_perf() {
     # Too lazy to handle errors in this function
+    if [ $argc_perf_period -eq 0 ]; then
+        echo_success "Perf is skipped"
+        return 0
+    fi
+
     local event=$1
     local qemu_pid=$(pgrep qemu)
     if [ $argc_password_stdin ] || [ -z $argc_password ]; then
@@ -118,9 +123,15 @@ start_fio() {
 }
 
 take_single_snap() {
-    local name="snap-$1"
-    local present_dir=$(pwd)
-    virsh snapshot-create-as --domain $argc_domain $name --diskspec $argc_block_device,file=$present_dir/$name --disk-only --no-metadata >/dev/null
+    local name="snap-$(date +'%d%m%Y')-$(date +%s)"
+
+    if [ -z $argc_snapshot_location ]; then
+        snapshot_dir=$(pwd)
+    else
+        snapshot_dir=$argc_snapshot_location
+    fi
+    
+    virsh snapshot-create-as --domain $argc_domain $name --diskspec $argc_block_device,file=$snapshot_dir/$name --disk-only --no-metadata >/dev/null
     
     if [ $? -eq 0 ]; then
         echo "$(($(date +%s) - $fio_clock))" >> /tmp/fio_snap
@@ -159,6 +170,22 @@ block_commit() {
     fi
 }
 
+block_stream() {
+
+    echo -n "$(($(date +%s) - $fio_clock))" >> /tmp/fio_snap_merge
+    virsh blockpull $argc_domain $argc_block_device --wait --timeout=$argc_blockcommit_timeout & >/dev/null
+    spinner_wait $! "Waiting for blockpull to terminate"
+    echo -n " $(($(date +%s) - $fio_clock))" >> /tmp/fio_snap_merge
+
+    if [ $? -eq 0 ]; then
+        echo_success "Block stream successful"
+        return 0
+    else
+        echo_failure "Block stream failed"
+        return 1
+    fi
+}
+
 # @cmd  Generate graphs
 # @option   --python-venv!              Location to python virtual environment to generate graphs
 # @option   -s --snapshots=1            Number of snapshots taken
@@ -166,8 +193,13 @@ visualize() {
 
     # Generate the graph
 
+    if [[ $argc_block_commit -ne 0 ]]; then
+        operation="commit"
+    else
+        operation="stream"
+    fi
     cd results; 
-    source $argc_python_venv && fio-plot -i ./ --source "https://triii.github.io/"  -T "Random read & write and block commit after $argc_snapshots snapshots" -g -t iops --xlabel-parent 0 -n 1 -d 1 -r randrw --vlines /tmp/fio_snap --vspans /tmp/fio_snap_merge --dpi 1000 -w 0.3 >/dev/null; 
+    source $argc_python_venv && fio-plot -i ./ --source "https://triii.github.io/"  -T "Random read & write and block $operation after $argc_snapshots snapshots" -g -t iops --xlabel-parent 0 -n 1 -d 1 -r randrw --vlines /tmp/fio_snap --vspans /tmp/fio_snap_merge --dpi 1000 -w 0.3 >/dev/null; 
     cd ..;
     echo_success "Benchmark graph generated"
 
@@ -195,7 +227,9 @@ exit_routines() {
     fi
 
     # Copy the perf files to results folder
-    mv perf.* results/
+    if [ $argc_perf_period -ne 0 ]; then
+        mv perf.* results/
+    fi
 
     return 0
 }
@@ -205,7 +239,8 @@ exit_routines() {
 # @option   --period=5                  Gap between consecutive snapshots
 # @option   -i --initial-wait=5         Number of seconds to wait for before starting fio
 # @option   -f --fio-ini=./fio.ini      Location of the ini configuration file for fio
-# @option   -b --block-commit=10        Number of seconds to wait for after last snapshot to start block commit
+# @option   --block-commit=0            Number of seconds to wait for after last snapshot to start block commit
+# @option   --block-stream=10           Number of seconds to wait for after last snapshot to start block pull
 # @option   --block-device=vda          Block device to perform block-commit
 # @option   -p --password               File containing the sudo password in base64 format
 # @flag     --password-stdin            Provide sudo password in stdin
@@ -213,7 +248,9 @@ exit_routines() {
 # @option   --domain-password           File containing the domain password in base64 format
 # @flag     --domain-password-stdin     Provide domain password password in stdin
 # @option   --domain-username           Username of the domain user to ssh and scp
-# @option   --perf-period=10            How many seconds to run perf
+# @option   --perf-period=0             How many seconds to run perf
+# @option   --snapshot-location         Location to store snapshots
+# @option   --blockcommit-timeout=90	Timeout in seconds for block commit
 benchmark() {
 
     # Execute the prerequisites
@@ -251,6 +288,10 @@ benchmark() {
         sleep $argc_block_commit &
         spinner_wait $! "Waiting to start block commit for $argc_block_commit seconds"
         block_commit;
+    else
+        sleep $argc_block_stream &
+        spinner_wait $! "Waiting to start block streaming for $argc_block_stream seconds"
+        block_stream;
     fi
     
     exit_routines;
@@ -292,7 +333,8 @@ flame() {
 # @option   --period=5                  Gap between consecutive snapshots
 # @option   -i --initial-wait=5         Number of seconds to wait for before starting fio
 # @option   -f --fio-ini=./fio.ini      Location of the ini configuration file for fio
-# @option   -b --block-commit=10        Number of seconds to wait for after last snapshot to start block commit
+# @option   --block-commit=0            Number of seconds to wait for after last snapshot to start block commit
+# @option   --block-stream=10           Number of seconds to wait for after last snapshot to start block pull
 # @option   --block-device=vda          Block device to perform block-commit
 # @option   -p --password               File containing the sudo password in base64 format
 # @flag     --password-stdin            Provide sudo password in stdin
@@ -301,7 +343,9 @@ flame() {
 # @flag     --domain-password-stdin     Provide domain password password in stdin
 # @option   --domain-username           Username of the domain user to ssh and scp
 # @option   --python-venv!              Location to python virtual environment to generate graphs
-# @option   --perf-period=10            How many seconds to run perf
+# @option   --perf-period=0             How many seconds to run perf
+# @option   --snapshot-location         Location to store snapshots
+# @option   --blockcommit-timeout=90    Timeout in seconds for block commit
 run() {
     benchmark;
     visualize;
