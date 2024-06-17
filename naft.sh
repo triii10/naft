@@ -24,6 +24,37 @@ get_serverip_from_domain() {
     remote_server=$(virsh net-dhcp-leases default | grep $argc_domain | awk '{print $5}' | cut -d "/" -f 1)
 }
 
+get_active_image() {
+    active_image_path=$(virsh domblklist $argc_domain | grep vda | awk '{print $2}')
+    active_image=$(basename $active_image_path)
+}
+
+delete_snaps() {
+    
+    # Get the active image. Do not delete that :)
+    get_active_image
+
+    # Delete other images
+    if [ ! -z "${active_image}" ]; then
+        snap_dir=/tmp
+        if [ $argc_snapshot_location ]; then
+            snap_dir=$argc_snapshot_location
+        fi
+        find $snap_dir -name 'snap-*' ! -name $active_image -type f -exec rm -f {} +
+
+        if [ $? -eq 0 ]; then
+            echo_success "Intermediate snapshots deleted"
+        else
+            echo_failure "Snapshot deletion failed"
+            return 1
+        fi
+    else
+        echo_failure "Not deleteing snapshots"
+    fi
+    
+    return 0
+}
+
 echo_success() {
     echo $'\u2714' $1
 }
@@ -35,7 +66,9 @@ echo_failure() {
 prerequisites() {
 
     # Get the Server IP of the domain
-    get_serverip_from_domain
+    # get_serverip_from_domain  # Currently not using libvirt anymore
+    remote_server=localhost
+    remote_port=1122
 
     run_timestamp=$(date +"%Y%m%d_%H%M%S")
     local folder_path="./results"
@@ -56,8 +89,13 @@ prerequisites() {
     fi
 
     # Perform SCP transfer
+    
+    # The remote path is /tmp. Modify to change
     remote_path="/tmp"
-    scp "$argc_fio_ini" "$remote_server:$remote_path/$folder_path/$argc_fio_ini" >/dev/null
+    # Create a results folder 
+    ssh $argc_domain_username@$remote_server -p $remote_port "mkdir -p $remote_path/$folder_path" >/dev/null
+
+    scp -P $remote_port "$argc_fio_ini" "$argc_domain_username@$remote_server:$remote_path/$folder_path/$argc_fio_ini" >/dev/null
     
     # Check the exit status of the scp command
     if [ $? -eq 0 ]; then
@@ -94,7 +132,7 @@ start_fio() {
     # The remote path is /tmp. Modify to change
     remote_path="/tmp/results"
     # Create a results folder 
-    ssh "$remote_server" "mkdir -p $remote_path" >/dev/null
+    ssh "$argc_domain_username@$remote_server" -p $remote_port "mkdir -p $remote_path" >/dev/null
 
     # Execute commands over SSH
     # Either send the password in a text file, or provide it in stdin.
@@ -102,15 +140,15 @@ start_fio() {
 
     if [ $argc_domain_password_stdin ] || [ -z $argc_domain_password ]; then
         fio_clock=$(date +%s)
-        fio_pid=$(ssh -tq "$remote_server" "sudo -S --prompt='' bash -c 'nohup fio --minimal $remote_path/$argc_fio_ini & echo \$!' >/dev/null" >/dev/null)
+        fio_pid=$(ssh -tq "$argc_domain_username@$remote_server" -p $remote_port "sudo -S --prompt='' bash -c 'nohup fio --minimal $remote_path/$argc_fio_ini & echo \$!' >/dev/null" >/dev/null)
     else
         fio_clock=$(date +%s)
-        fio_pid=$(ssh -tq "$remote_server" "base64 -d $argc_domain_password | sudo --prompt='' -S bash -c 'nohup fio --minimal $remote_path/$argc_fio_ini & echo \$!' >/dev/null" >/dev/null)
+        fio_pid=$(ssh -tq "$argc_domain_username@$remote_server" -p $remote_port "base64 -d $argc_domain_password | sudo --prompt='' -S bash -c 'nohup fio --minimal $remote_path/$argc_fio_ini & echo \$!' >/dev/null" >/dev/null)
     fi
-    fio_pid=$(ssh "$remote_server" "pgrep fio -n")
+    fio_pid=$(ssh "$argc_domain_username@$remote_server" -p $remote_port "pgrep fio -n")
 
-    echo '' > /tmp/fio_snap
-    echo '' > /tmp/fio_snap_merge
+    rm -rf /tmp/fio_snap
+    rm -rf /tmp/fio_snap_merge
     
     # Check the exit status of the SSH command
     if [ $? -eq 0 ]; then
@@ -131,8 +169,8 @@ take_single_snap() {
         snapshot_dir=$argc_snapshot_location
     fi
     
-    virsh snapshot-create-as --domain $argc_domain $name --diskspec $argc_block_device,file=$snapshot_dir/$name --disk-only --no-metadata >/dev/null
-    
+    # virsh snapshot-create-as --domain $argc_domain $name --diskspec $argc_block_device,file=$snapshot_dir/$name --disk-only --no-metadata >/dev/null
+    echo "snapshot_blkdev $argc_block_device $snapshot_dir/$name" | sudo socat - UNIX-CONNECT:$argc_socket_location/qemu-monitor-socket > /dev/null
     if [ $? -eq 0 ]; then
         echo "$(($(date +%s) - $fio_clock))" >> /tmp/fio_snap
         return 0
@@ -173,8 +211,13 @@ block_commit() {
 block_stream() {
 
     echo -n "$(($(date +%s) - $fio_clock))" >> /tmp/fio_snap_merge
-    virsh blockpull $argc_domain $argc_block_device --wait --timeout=$argc_blockcommit_timeout & >/dev/null
-    spinner_wait $! "Waiting for blockpull to terminate"
+    # virsh blockpull $argc_domain $argc_block_device --wait --timeout=$argc_blockstream_timeout & >/dev/null
+    echo "block_stream $argc_block_device" | sudo socat - UNIX-CONNECT:$argc_socket_location/qemu-monitor-socket >/dev/null
+
+    while true; do output=$(echo 'info block-jobs' | sudo socat - UNIX-CONNECT:$argc_socket_location/qemu-monitor-socket | grep "No"); if echo "$output" | grep -q "No active jobs"; then break; fi; sleep 1; done &
+    blockpull_pid=$!
+    start_perf "during_stream"
+    spinner_wait $blockpull_pid "Waiting for streaming to terminate"
     echo -n " $(($(date +%s) - $fio_clock))" >> /tmp/fio_snap_merge
 
     if [ $? -eq 0 ]; then
@@ -200,13 +243,15 @@ visualize() {
     fi
     cd results; 
     source $argc_python_venv && fio-plot -i ./ --source "https://triii.github.io/"  -T "Random read & write and block $operation after $argc_snapshots snapshots" -g -t iops --xlabel-parent 0 -n 1 -d 1 -r randrw --vlines /tmp/fio_snap --vspans /tmp/fio_snap_merge --dpi 1000 -w 0.3 >/dev/null; 
+    mkdir -p output
+    mv *.png output/
     cd ..;
     echo_success "Benchmark graph generated"
 
 }
 
 exit_routines() {
-    ssh "$remote_server" "base64 -d $argc_domain_password | sudo --prompt='' -S bash -c '$(declare -f spinner_wait); spinner_wait $fio_pid \"Waiting for fio\"'"
+    ssh "$argc_domain_username@$remote_server" -p $remote_port "base64 -d $argc_domain_password | sudo --prompt='' -S bash -c '$(declare -f spinner_wait); spinner_wait $fio_pid \"Waiting for fio\"'"
     # Check the exit status of the SSH command
     if [ $? -eq 0 ]; then
         echo_success "fio completed successfully"
@@ -216,7 +261,7 @@ exit_routines() {
     fi
 
     # Now copy the results folder
-    scp -r "$remote_server":"$remote_path/$folder_path" ./ >/dev/null
+    scp -P $remote_port -r "$argc_domain_username@$remote_server":"$remote_path/$folder_path" ./ >/dev/null
     
     # Check the exit status of the scp command
     if [ $? -eq 0 ]; then
@@ -227,8 +272,18 @@ exit_routines() {
     fi
 
     # Copy the perf files to results folder
+    mkdir -p results/perf_results
+    mkdir -p results/output
     if [ $argc_perf_period -ne 0 ]; then
-        mv perf.* results/
+        mv perf.* results/perf_results
+    fi
+
+    # Copy the snap timestamps
+    if [ -f /tmp/fio_snap_merge ]; then
+        cp /tmp/fio_snap_merge results/
+    fi
+    if [ -f /tmp/fio_snap ]; then
+        cp /tmp/fio_snap results/
     fi
 
     return 0
@@ -250,7 +305,8 @@ exit_routines() {
 # @option   --domain-username           Username of the domain user to ssh and scp
 # @option   --perf-period=0             How many seconds to run perf
 # @option   --snapshot-location         Location to store snapshots
-# @option   --blockcommit-timeout=90	Timeout in seconds for block commit
+# @option   --blockstream-timeout=90    Timeout in seconds for block commit
+# @option   --socket-location=/tmp      Location of QEMU sockets
 benchmark() {
 
     # Execute the prerequisites
@@ -288,10 +344,13 @@ benchmark() {
         sleep $argc_block_commit &
         spinner_wait $! "Waiting to start block commit for $argc_block_commit seconds"
         block_commit;
-    else
+    elif [[ $argc_block_stream -ne 0 ]]; then
         sleep $argc_block_stream &
         spinner_wait $! "Waiting to start block streaming for $argc_block_stream seconds"
+        start_perf "before_stream"
         block_stream;
+    else
+        echo_success "Skipped block commit or block stream"
     fi
     
     exit_routines;
@@ -303,17 +362,22 @@ benchmark() {
 
 # @cmd    Generate flame graphs from perf record outputs
 # @option --stackcollapse=$HOME/bin         Location of stackcollapse and flamegraph programs
+# @option --location=./                     Location where flame graphs are located
 flame() {
 
     # Get all files with the prefix "perf." in the current directory
+    find . -type f -name "*.svg" -exec rm -f {} \;
+    find . -type f -name "*.stack" -exec rm -f {} \;
     file_list=()
-    for file in ./perf.*; do
+    for file in ./$argc_location/**/perf.*; do
         # Check if the file exists
         if [ -f "$file" ]; then
             # Add the file to the array
+            file=$(realpath $file)
             file_list+=("$file")
         fi
     done
+    echo $file_list
 
     # For each file, generate the flame graph
     for file in "${file_list[@]}"; do
@@ -324,9 +388,31 @@ flame() {
         fi
         stackcollapse-perf.pl --all $file.stack | flamegraph.pl > $file.flame.svg
     done
+
+    find . -type f -name "*.stack" -exec rm -f {} \;
+    
+    mkdir -p $argc_location/output
+    find . -type f -name "*.svg" -exec mv {} ./$argc_location/output/ \;
+
     echo_success "Flame graphs created"
 
 }
+
+# @cmd    Generate a stat file with the fio merge timestamps
+# @option   -p --path=../tools/avg_iops.py      Path to the python script
+stat() {
+    python3.10 $argc_path
+    echo_success "Stat file generated in results"
+}
+
+# @cmd    Cleanup intermediate snaps
+# @option   -d --domain=poseidon            Domain name
+# @option   --snapshot-location=/tmp        Location to store snapshots
+cleanup() {
+    delete_snaps
+}
+
+
 
 # @cmd  Run both benchmark and visualise commands
 # @option   -s --snapshots=1            Number of snapshots to take
@@ -335,7 +421,7 @@ flame() {
 # @option   -f --fio-ini=./fio.ini      Location of the ini configuration file for fio
 # @option   --block-commit=0            Number of seconds to wait for after last snapshot to start block commit
 # @option   --block-stream=10           Number of seconds to wait for after last snapshot to start block pull
-# @option   --block-device=vda          Block device to perform block-commit
+# @option   --block-device=drive0       Block device to perform block-commit
 # @option   -p --password               File containing the sudo password in base64 format
 # @flag     --password-stdin            Provide sudo password in stdin
 # @option   -d --domain!                Name of the VM to run benchmarks on
@@ -345,7 +431,8 @@ flame() {
 # @option   --python-venv!              Location to python virtual environment to generate graphs
 # @option   --perf-period=0             How many seconds to run perf
 # @option   --snapshot-location         Location to store snapshots
-# @option   --blockcommit-timeout=90    Timeout in seconds for block commit
+# @option   --blockstream-timeout=90    Timeout in seconds for block commit
+# @option   --socket-location=/tmp      Location of QEMU sockets
 run() {
     benchmark;
     visualize;
