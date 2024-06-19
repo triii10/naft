@@ -272,18 +272,18 @@ exit_routines() {
     fi
 
     # Copy the perf files to results folder
-    mkdir -p results/perf_results
-    mkdir -p results/output
+    mkdir -p results/perf_results >/dev/null
+    mkdir -p results/output >/dev/null
     if [ $argc_perf_period -ne 0 ]; then
-        mv perf.* results/perf_results
+        mv perf.* results/perf_results >/dev/null
     fi
 
     # Copy the snap timestamps
     if [ -f /tmp/fio_snap_merge ]; then
-        cp /tmp/fio_snap_merge results/
+        cp /tmp/fio_snap_merge results/ >/dev/null
     fi
     if [ -f /tmp/fio_snap ]; then
-        cp /tmp/fio_snap results/
+        cp /tmp/fio_snap results/ >/dev/null
     fi
 
     return 0
@@ -377,7 +377,6 @@ flame() {
             file_list+=("$file")
         fi
     done
-    echo $file_list
 
     # For each file, generate the flame graph
     for file in "${file_list[@]}"; do
