@@ -145,7 +145,7 @@ start_fio() {
         fio_clock=$(date +%s)
         fio_pid=$(ssh -tq "$argc_domain_username@$remote_server" -p $remote_port "base64 -d $argc_domain_password | sudo --prompt='' -S bash -c 'nohup fio --minimal $remote_path/$argc_fio_ini & echo \$!' >/dev/null" >/dev/null)
     fi
-    fio_pid=$(ssh "$argc_domain_username@$remote_server" -p $remote_port "pgrep fio -n")
+    fio_pid=$(ssh "$argc_domain_username@$remote_server" -p $remote_port "pgrep fio -nx")
 
     rm -rf /tmp/fio_snap
     rm -rf /tmp/fio_snap_merge
@@ -273,7 +273,6 @@ exit_routines() {
 
     # Copy the perf files to results folder
     mkdir -p results/perf_results >/dev/null
-    mkdir -p results/output >/dev/null
     if [ $argc_perf_period -ne 0 ]; then
         mv perf.* results/perf_results >/dev/null
     fi
