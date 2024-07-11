@@ -99,7 +99,8 @@ prerequisites() {
     
     # Check the exit status of the scp command
     if [ $? -eq 0 ]; then
-        echo_success "$argc_fio_ini file transferred"
+        file_name=$(basename $argc_fio_ini)
+        echo_success "File $file_name transferred to $argc_domain_username@$remote_server"
     else
         echo_failure "SCP of fio.ini failed"
         return 1
@@ -212,7 +213,8 @@ block_stream() {
 
     echo -n "$(($(date +%s) - $fio_clock))" >> /tmp/fio_snap_merge
     # virsh blockpull $argc_domain $argc_block_device --wait --timeout=$argc_blockstream_timeout & >/dev/null
-    echo "block_stream $argc_block_device" | sudo socat - UNIX-CONNECT:$argc_socket_location/qemu-monitor-socket >/dev/null
+    (echo '{"execute": "qmp_capabilities"}'; sleep 1; echo '{"execute": "block-stream", "arguments": {"device": "drive0", "adaptive-stream": true, "adaptive-threshold": 2000000000, "pause-time": 10}}') | sudo socat - UNIX-CONNECT:$argc_socket_location/qemu-qmp-socket >/dev/null
+    # echo "block_stream $argc_block_device --adaptive=1 --adaptive-threshold=200000000 --pause-time=10" | sudo socat - UNIX-CONNECT:$argc_socket_location/qemu-monitor-socket
 
     while true; do output=$(echo 'info block-jobs' | sudo socat - UNIX-CONNECT:$argc_socket_location/qemu-monitor-socket | grep "No"); if echo "$output" | grep -q "No active jobs"; then break; fi; sleep 1; done &
     blockpull_pid=$!
@@ -242,7 +244,12 @@ visualize() {
         operation="stream"
     fi
     cd results; 
-    source $argc_python_venv && fio-plot -i ./ --source "https://triii.github.io/"  -T "Random read & write and block $operation after $argc_snapshots snapshots" -g -t iops --xlabel-parent 0 -n 1 -d 1 -r randrw --vlines /tmp/fio_snap --vspans /tmp/fio_snap_merge --dpi 1000 -w 0.3 >/dev/null; 
+    if find . -type f -name "*iops.*.log" | grep -q .; then
+        source $argc_python_venv && fio-plot -i ./ --source "https://triii.github.io/"  -T "Random read & write and block $operation after $argc_snapshots snapshots" -g -t iops --xlabel-parent 0 -n 1 -d 1 -r randrw --vlines /tmp/fio_snap --vspans /tmp/fio_snap_merge --dpi 1000 -w 0.3 >/dev/null; 
+    fi
+    if find . -type f -name "*bw.*.log" | grep -q .; then
+        source $argc_python_venv && fio-plot -i ./ --source "https://triii.github.io/"  -T "Random read & write and block $operation after $argc_snapshots snapshots" -g -t bw --xlabel-parent 0 -n 1 -d 1 -r randrw --vlines /tmp/fio_snap --vspans /tmp/fio_snap_merge --dpi 1000 -w 0.3 >/dev/null; 
+    fi
     mkdir -p output
     mv *.png output/
     cd ..;
