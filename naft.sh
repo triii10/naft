@@ -95,8 +95,9 @@ prerequisites() {
     # Create a results folder 
     ssh $argc_domain_username@$remote_server -p $remote_port "mkdir -p $remote_path/$folder_path" >/dev/null
 
+    # Transfer the fio file and the fio run script
     scp -P $remote_port "$argc_fio_ini" "$argc_domain_username@$remote_server:$remote_path/$folder_path/$argc_fio_ini" >/dev/null
-    
+
     # Check the exit status of the scp command
     if [ $? -eq 0 ]; then
         file_name=$(basename $argc_fio_ini)
@@ -104,6 +105,18 @@ prerequisites() {
     else
         echo_failure "SCP of fio.ini failed"
         return 1
+    fi
+
+    # If "bursty_fio.sh" file exists in the current directory, transfer it
+    if [ -f "bursty_fio.sh" ]; then
+        scp -P $remote_port "bursty_fio.sh" "$argc_domain_username@$remote_server:$remote_path/$folder_path/bursty_fio.sh" >/dev/null
+        # Check the exit status of the scp command
+        if [ $? -eq 0 ]; then
+            echo_success "File 'bursty_fio.sh' transferred to $argc_domain_username@$remote_server"
+        else
+            echo_failure "SCP of 'bursty_fio.sh' failed"
+            return 1
+        fi
     fi
 
     return 0;
@@ -139,23 +152,58 @@ start_fio() {
     # Either send the password in a text file, or provide it in stdin.
     # Yes, I know it's not secure, but it does the job for me in an internal system
 
-    if [ $argc_domain_password_stdin ] || [ -z $argc_domain_password ]; then
-        fio_clock=$(date +%s)
-        fio_pid=$(ssh -tq "$argc_domain_username@$remote_server" -p $remote_port "sudo -S --prompt='' bash -c 'nohup fio --minimal $remote_path/$argc_fio_ini & echo \$!' >/dev/null" >/dev/null)
-    else
-        fio_clock=$(date +%s)
-        fio_pid=$(ssh -tq "$argc_domain_username@$remote_server" -p $remote_port "base64 -d $argc_domain_password | sudo --prompt='' -S bash -c 'nohup fio --minimal $remote_path/$argc_fio_ini & echo \$!' >/dev/null" >/dev/null)
-    fi
-    fio_pid=$(ssh "$argc_domain_username@$remote_server" -p $remote_port "pgrep fio -nx")
-
     rm -rf /tmp/fio_snap
     rm -rf /tmp/fio_snap_merge
+    if [ $argc_domain_password_stdin ] || [ -z $argc_domain_password ]; then
+        fio_clock=$(date +%s)
+        ssh -tq "$argc_domain_username@$remote_server" -p $remote_port "sudo -S --prompt='' bash -c 'nohup fio --minimal $remote_path/$argc_fio_ini & echo \$!' >/dev/null" >/dev/null
+    else
+        fio_clock=$(date +%s)
+        ssh -tq "$argc_domain_username@$remote_server" -p $remote_port "base64 -d $argc_domain_password | sudo --prompt='' -S bash -c 'nohup fio --minimal $remote_path/$argc_fio_ini & echo \$!' >/dev/null" >/dev/null
+    fi
     
     # Check the exit status of the SSH command
     if [ $? -eq 0 ]; then
         echo_success "fio started"
+        fio_pid=$(ssh "$argc_domain_username@$remote_server" -p $remote_port "pgrep fio -nx")
     else
         echo "fio could not be started"
+        return 1
+    fi
+    return 0
+}
+
+start_bursty_fio() {
+    # The remote path is /tmp. Modify to change
+    remote_path="/tmp/results"
+    # Create a results folder 
+    ssh "$argc_domain_username@$remote_server" -p $remote_port "mkdir -p $remote_path" >/dev/null
+
+    # Execute commands over SSH
+    # Either send the password in a text file, or provide it in stdin.
+    # Yes, I know it's not secure, but it does the job for me in an internal system
+
+    rm -rf /tmp/fio_snap
+    rm -rf /tmp/fio_snap_merge
+    burst_input='300 -100 60 -50 30 -20 100 -40 200 -100 400'
+    if [ -n $argc_burst_file ]; then
+        burst_input=$(cat $argc_burst_file)
+    fi
+    if [ $argc_domain_password_stdin ] || [ -z $argc_domain_password ]; then
+        fio_clock=$(date +%s)
+        # Think about the pattern later
+        ssh -tq "$argc_domain_username@$remote_server" -p $remote_port "sudo -S --prompt='' bash -c 'nohup $remote_path/bursty_fio.sh $burst_input & echo \$!' >/dev/null" >/dev/null
+    else
+        fio_clock=$(date +%s)
+        ssh -tq "$argc_domain_username@$remote_server" -p $remote_port "base64 -d $argc_domain_password | sudo --prompt='' -S bash -c 'nohup $remote_path/bursty_fio.sh $burst_input & echo \$!' >/dev/null" >/dev/null
+    fi
+    
+    # Check the exit status of the SSH command
+    if [ $? -eq 0 ]; then
+        fio_pid=$(ssh "$argc_domain_username@$remote_server" -p $remote_port "pgrep bursty_fio.sh -nx")
+        echo_success "bursty_fio started: $fio_pid"
+    else
+        echo "bursty_fio could not be started"
         return 1
     fi
     return 0
@@ -211,19 +259,77 @@ block_commit() {
 
 block_stream() {
 
-    echo -n "$(($(date +%s) - $fio_clock))" >> /tmp/fio_snap_merge
+    # echo -n "$(($(date +%s) - $fio_clock))" >> /tmp/fio_snap_merge_temp
     # virsh blockpull $argc_domain $argc_block_device --wait --timeout=$argc_blockstream_timeout & >/dev/null
-    (echo '{"execute": "qmp_capabilities"}'; sleep 1; echo '{"execute": "block-stream", "arguments": {"device": "drive0", "adaptive-stream": true, "adaptive-threshold": 2000000000, "pause-time": 10}}') | sudo socat - UNIX-CONNECT:$argc_socket_location/qemu-qmp-socket >/dev/null
+    
+    # Trigger HMP command to start streaming
+    adaptive_stream='{"execute": "block-stream", "arguments": {"device": "drive0"}}'
+    if [ "$argc_adaptive_streaming" == "1" ]; then
+        adaptive_stream='{"execute": "block-stream", "arguments": {"device": "drive0", "adaptive-stream": true, "pause-time": 5}}'
+    fi
+    (echo '{"execute": "qmp_capabilities"}'; sleep 1; echo $adaptive_stream) | sudo socat - UNIX-CONNECT:$argc_socket_location/qemu-qmp-socket >/dev/null
     # echo "block_stream $argc_block_device --adaptive=1 --adaptive-threshold=200000000 --pause-time=10" | sudo socat - UNIX-CONNECT:$argc_socket_location/qemu-monitor-socket
 
-    while true; do output=$(echo 'info block-jobs' | sudo socat - UNIX-CONNECT:$argc_socket_location/qemu-monitor-socket | grep "No"); if echo "$output" | grep -q "No active jobs"; then break; fi; sleep 1; done &
+    # Monitor when streaming ends
+    while true; do 
+        output=$(echo 'info block-jobs' | sudo socat - UNIX-CONNECT:$argc_socket_location/qemu-monitor-socket | grep "No"); 
+        if echo "$output" | grep -qE "No active jobs|Connection refused"; then 
+            break; 
+        fi; 
+        sleep 1; 
+    done &
+    
     blockpull_pid=$!
     start_perf "during_stream"
+    
+    # Monitor the status of the block job
+    rm -rf output.log
+    cmd="echo 'info block-jobs' | sudo socat - UNIX-CONNECT:$argc_socket_location/qemu-monitor-socket | awk -F 'status ' '{print \$2}' | awk '{print \$1}' | xargs"
+    while true; do 
+        current_time=$(date +%s); 
+        elapsed_time=$((current_time - $fio_clock)); 
+        status=$($cmd | xargs); 
+        echo "$elapsed_time,$status" >> output.log 2>&1; 
+        sleep 1; 
+    done & 
+    nohup_pid=$!
+ 
+    # Wait for streaming to terminate
     spinner_wait $blockpull_pid "Waiting for streaming to terminate"
-    echo -n " $(($(date +%s) - $fio_clock))" >> /tmp/fio_snap_merge
+
+    # Kill the job monitoring process as soon as streaming ends
+    kill -9 $nohup_pid
 
     if [ $? -eq 0 ]; then
         echo_success "Block stream successful"
+
+        # Now it's time to kill the nohup process that checks for the streaming status 
+        # and create snap_merge file
+
+        # echo -n " $(($(date +%s) - $fio_clock))" >> /tmp/fio_snap_merge
+        while IFS=',' read -r time status; do
+            if [[ "$status" == "2" ]]; then
+                if [[ "$status" != "$previous_status" ]]; then
+                if [[ -n "$previous_status" && "$previous_status" == "2" ]]; then
+                    echo "$start_time $end_time" >> /tmp/fio_snap_merge
+                fi
+                start_time="$time"
+                fi
+                end_time="$time"
+            else
+                if [[ "$previous_status" == "2" ]]; then
+                echo "$start_time $end_time" >> /tmp/fio_snap_merge
+                fi
+                previous_status="$status"
+                start_time=""
+                end_time=""
+            fi
+            previous_status="$status"
+        done < "output.log"
+        if [[ "$previous_status" == "2" ]]; then
+            echo "$start_time $end_time" >> /tmp/fio_snap_merge
+        fi
+
         return 0
     else
         echo_failure "Block stream failed"
@@ -245,10 +351,10 @@ visualize() {
     fi
     cd results; 
     if find . -type f -name "*iops.*.log" | grep -q .; then
-        source $argc_python_venv && fio-plot -i ./ --source "https://triii.github.io/"  -T "Random read & write and block $operation after $argc_snapshots snapshots" -g -t iops --xlabel-parent 0 -n 1 -d 1 -r randrw --vlines /tmp/fio_snap --vspans /tmp/fio_snap_merge --dpi 1000 -w 0.3 >/dev/null; 
+        source $argc_python_venv && fio-plot -i ./ --source "https://triii.github.io/"  -T "Random read & write and block $operation after $argc_snapshots snapshots" -g -t iops --xlabel-parent 0 -n 1 -d 64 -r randrw --vlines /tmp/fio_snap --vspans /tmp/fio_snap_merge --dpi 600 -w 0.3 >/dev/null; 
     fi
     if find . -type f -name "*bw.*.log" | grep -q .; then
-        source $argc_python_venv && fio-plot -i ./ --source "https://triii.github.io/"  -T "Random read & write and block $operation after $argc_snapshots snapshots" -g -t bw --xlabel-parent 0 -n 1 -d 1 -r randrw --vlines /tmp/fio_snap --vspans /tmp/fio_snap_merge --dpi 1000 -w 0.3 >/dev/null; 
+        source $argc_python_venv && fio-plot -i ./ --source "https://triii.github.io/"  -T "Random read & write and block $operation after $argc_snapshots snapshots" -g -t bw --xlabel-parent 0 -n 1 -d 64 -r randrw --vlines /tmp/fio_snap --vspans /tmp/fio_snap_merge --dpi 600 -w 0.3 >/dev/null; 
     fi
     mkdir -p output
     mv *.png output/
@@ -313,6 +419,8 @@ exit_routines() {
 # @option   --snapshot-location         Location to store snapshots
 # @option   --blockstream-timeout=90    Timeout in seconds for block commit
 # @option   --socket-location=/tmp      Location of QEMU sockets
+# @option   --burst-file                Location to the file containing input to bursty_fio
+# @flag     --adaptive-streaming        Enable adaptive streaming
 benchmark() {
 
     # Execute the prerequisites
@@ -322,10 +430,18 @@ benchmark() {
         return 1
     fi
 
-    start_fio;
-    if [ $? -eq 1 ]; then
-        echo_failure "Fio could not be started. Exiting.."
-        return 1
+    if [ -f "bursty_fio.sh" ]; then
+        start_bursty_fio;
+        if [ $? -eq 1 ]; then
+            echo_failure "Bursty could not be started. Exiting.."
+            return 1
+        fi
+    else
+        start_fio;
+        if [ $? -eq 1 ]; then
+            echo_failure "Fio could not be started. Exiting.."
+            return 1
+        fi
     fi
 
     # Wait for some seconds specified in initial wait
@@ -438,6 +554,8 @@ cleanup() {
 # @option   --snapshot-location         Location to store snapshots
 # @option   --blockstream-timeout=90    Timeout in seconds for block commit
 # @option   --socket-location=/tmp      Location of QEMU sockets
+# @option   --burst-file                Location to the file containing input to bursty_fio
+# @flag     --adaptive-streaming        Enable adaptive streaming
 run() {
     benchmark;
     visualize;
